@@ -1,17 +1,22 @@
 ﻿import numpy as np
 import pandas as pd
-import statsmodels.api as sm
+
+
+class OLSResult:
+    def __init__(self, params, rsquared, rsquared_adj, nobs):
+        self.params = params
+        self.rsquared = rsquared
+        self.rsquared_adj = rsquared_adj
+        self.nobs = nobs
 
 
 def detect_columns(df: pd.DataFrame):
-    # date
     date_col = None
     for c in df.columns:
         if "date" in c.lower():
             date_col = c
             break
 
-    # target
     target_col = None
     for key in ["revenue", "sales", "conversions", "orders", "target"]:
         for c in df.columns:
@@ -21,9 +26,9 @@ def detect_columns(df: pd.DataFrame):
         if target_col:
             break
 
-    # spend columns
     spend_cols = [
-        c for c in df.columns
+        c
+        for c in df.columns
         if any(k in c.lower() for k in ["spend", "cost", "media"])
         and c != target_col
     ]
@@ -31,60 +36,101 @@ def detect_columns(df: pd.DataFrame):
     return date_col, target_col, spend_cols
 
 
-def geometric_adstock(x, alpha=0.5):
+def _adstock(x: np.ndarray, alpha: float) -> np.ndarray:
     out = np.zeros_like(x, dtype=float)
     carry = 0.0
-    for i in range(len(x)):
-        carry = x[i] + alpha * carry
+    for i, v in enumerate(x):
+        carry = float(v) + alpha * carry
         out[i] = carry
     return out
 
 
-def prepare_mmm_design(df, date_col, target_col, spend_cols, adstock_alpha=0.5, use_saturation=True):
-    work = df.copy()
+def prepare_mmm_design(
+    df: pd.DataFrame,
+    date_col: str | None,
+    target_col: str,
+    spend_cols: list[str],
+    adstock_alpha: float = 0.5,
+    use_saturation: bool = True,
+):
+    d = df.copy()
 
-    if date_col and date_col in work.columns:
-        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
-        work = work.sort_values(date_col)
+    # Sort by date if available
+    if date_col and date_col in d.columns:
+        d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+        d = d.dropna(subset=[date_col]).sort_values(date_col)
 
-    X_parts = []
-    meta = {"channels": {}}
+    d = d.dropna(subset=[target_col]).copy()
+
+    X = pd.DataFrame(index=d.index)
+    X["const"] = 1.0
 
     for c in spend_cols:
-        x = pd.to_numeric(work[c], errors="coerce").fillna(0.0).values
-        x_ad = geometric_adstock(x, adstock_alpha)
-        meta["channels"][c] = {"adstock_alpha": float(adstock_alpha)}
+        x = pd.to_numeric(d[c], errors="coerce").fillna(0.0).to_numpy()
 
-        X_parts.append(pd.DataFrame({f"{c}__x": x_ad}, index=work.index))
+        # adstock
+        x = _adstock(x, adstock_alpha)
 
-    X = pd.concat(X_parts, axis=1) if X_parts else pd.DataFrame(index=work.index)
-    y = pd.to_numeric(work[target_col], errors="coerce")
+        # optional saturation (simple, stable)
+        if use_saturation:
+            x = np.log1p(np.maximum(x, 0))
 
-    mask = y.notna()
-    X = X.loc[mask]
-    y = y.loc[mask]
+        X[f"{c}__x"] = x
 
-    X = sm.add_constant(X, has_constant="add")
+    y = pd.to_numeric(d[target_col], errors="coerce").to_numpy(dtype=float)
+
+    meta = {"date_col": date_col, "target_col": target_col, "spend_cols": spend_cols}
     return X, y, meta
 
 
-def fit_mmm_ols(X, y):
-    model = sm.OLS(y.values, X.values)
-    return model.fit()
+def fit_mmm_ols(X: pd.DataFrame, y: np.ndarray) -> OLSResult:
+    Xmat = X.to_numpy(dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    # least squares solve
+    beta, *_ = np.linalg.lstsq(Xmat, y, rcond=None)
+
+    yhat = Xmat @ beta
+    resid = y - yhat
+
+    ss_res = float(np.sum(resid**2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2)) if len(y) else 0.0
+
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    n = Xmat.shape[0]
+    p = Xmat.shape[1] - 1  # exclude intercept
+    r2_adj = 1.0 - (1.0 - r2) * (n - 1) / (n - p - 1) if n > (p + 1) else r2
+
+    return OLSResult(params=beta, rsquared=r2, rsquared_adj=r2_adj, nobs=n)
 
 
-def channel_contributions(X, params):
-    return pd.DataFrame(X.values * params.reshape(1, -1), columns=X.columns, index=X.index)
+def channel_contributions(X: pd.DataFrame, params: np.ndarray) -> pd.DataFrame:
+    # contribution per feature per row
+    return X.multiply(params, axis=1)
 
 
-def roi_by_channel(df, contrib, spend_cols):
+def roi_by_channel(df: pd.DataFrame, contrib: pd.DataFrame, spend_cols: list[str]) -> pd.DataFrame:
     rows = []
     for c in spend_cols:
-        col = f"{c}__x"
-        if col not in contrib.columns:
+        feat = f"{c}__x"
+        if feat not in contrib.columns:
             continue
-        total_contrib = float(contrib[col].sum())
-        total_spend = float(pd.to_numeric(df[c], errors="coerce").fillna(0.0).sum())
-        roi = (total_contrib / total_spend) if total_spend > 0 else np.nan
-        rows.append({"channel": c, "total_spend": total_spend, "total_contribution": total_contrib, "roi": roi})
-    return pd.DataFrame(rows).sort_values("roi", ascending=False)
+
+        total_contrib = float(contrib[feat].sum())
+        spend = float(pd.to_numeric(df[c], errors="coerce").fillna(0.0).sum())
+        roi = (total_contrib / spend) if spend > 0 else np.nan
+
+        rows.append(
+            {
+                "channel": c,
+                "spend": spend,
+                "contribution": total_contrib,
+                "roi": roi,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if len(out):
+        out = out.sort_values("roi", ascending=False)
+    return out
