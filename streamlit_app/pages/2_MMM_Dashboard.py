@@ -1,64 +1,156 @@
+import sys
+from pathlib import Path
+
+# ---------------------------------------
+# Add repo root to PYTHONPATH (Cloud fix)
+# ---------------------------------------
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# ---------------------------------------
+# Imports
+# ---------------------------------------
 import streamlit as st
 import pandas as pd
-from analytics.experiments import ab_test_sample_size_per_group, geo_test_mde
+import numpy as np
+import plotly.express as px
 
-st.set_page_config(page_title="Experiment Designer", page_icon="🧪", layout="wide")
+from analytics.mmm import (
+    detect_columns,
+    prepare_mmm_design,
+    fit_mmm_ols,
+    channel_contributions,
+    roi_by_channel,
+)
 
-st.title("🧪 Causal Experiment Designer")
-st.caption("Quick planning for A/B tests and geo-tests: sample size, MDE, power, and rollout timeline.")
+# ---------------------------------------
+# Page config
+# ---------------------------------------
+st.set_page_config(page_title="MMM Dashboard", page_icon="📈", layout="wide")
 
-tab1, tab2 = st.tabs(["🅰️ A/B Test (Digital)", "🌍 Geo-Test (Regional)"])
+st.title("📈 Marketing Mix Modeling Dashboard")
+st.caption("Upload marketing data → Estimate ROI & channel contributions")
+
+# ---------------------------------------
+# Sidebar
+# ---------------------------------------
+with st.sidebar:
+    st.header("Data Controls")
+
+    demo_mode = st.toggle("Demo Mode", value=True)
+
+    uploaded = None
+    if not demo_mode:
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+
+    st.divider()
+
+    st.header("Model Controls")
+
+    adstock_alpha = st.slider("Adstock Alpha", 0.0, 0.95, 0.50, 0.05)
+    use_saturation = st.checkbox("Use saturation", value=True)
+
+# ---------------------------------------
+# Demo dataset
+# ---------------------------------------
+def load_demo_df():
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2024-01-01", periods=52, freq="W")
+
+    tv = rng.normal(6000, 1200, len(dates)).clip(500)
+    search = rng.normal(3500, 700, len(dates)).clip(300)
+    social = rng.normal(1800, 500, len(dates)).clip(200)
+
+    base = 90000 + 4000 * np.sin(np.linspace(0, 2 * np.pi, len(dates)))
+    revenue = base + 3.2 * tv + 5.1 * search + 2.0 * social + rng.normal(0, 6000, len(dates))
+
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "revenue": revenue,
+            "tv_spend": tv,
+            "search_spend": search,
+            "social_spend": social,
+        }
+    )
+
+# ---------------------------------------
+# Load data
+# ---------------------------------------
+if demo_mode:
+    df = load_demo_df()
+else:
+    if uploaded is None:
+        st.info("Upload a CSV or enable Demo Mode.")
+        st.stop()
+
+    df = pd.read_csv(uploaded)
+
+# ---------------------------------------
+# Preview
+# ---------------------------------------
+st.subheader("📄 Data Preview")
+st.dataframe(df.head(15), use_container_width=True)
+
+date_col, target_col, spend_cols = detect_columns(df)
+
+st.write(
+    {
+        "Date Column": date_col,
+        "Target Column": target_col,
+        "Spend Columns": spend_cols,
+    }
+)
+
+if not target_col or not spend_cols:
+    st.error("Could not detect required columns.")
+    st.stop()
+
+# ---------------------------------------
+# Model
+# ---------------------------------------
+X, y, meta = prepare_mmm_design(
+    df=df,
+    date_col=date_col,
+    target_col=target_col,
+    spend_cols=spend_cols,
+    adstock_alpha=adstock_alpha,
+    use_saturation=use_saturation,
+)
+
+res = fit_mmm_ols(X, y)
+contrib = channel_contributions(X, res.params)
+roi = roi_by_channel(df.loc[X.index], contrib, spend_cols)
+
+# ---------------------------------------
+# KPI Cards
+# ---------------------------------------
+st.subheader("📊 Model Summary")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Rows", int(res.nobs))
+c2.metric("R²", f"{res.rsquared:.3f}")
+c3.metric("Adj R²", f"{res.rsquared_adj:.3f}")
+c4.metric("Channels", len(spend_cols))
+
+# ---------------------------------------
+# Tabs
+# ---------------------------------------
+tab1, tab2 = st.tabs(["ROI", "Contributions"])
 
 with tab1:
-    st.subheader("A/B Test Sample Size (per group)")
+    st.subheader("💰 ROI by Channel")
+    st.dataframe(roi, use_container_width=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    baseline = c1.number_input("Baseline metric", value=0.05, min_value=0.0, help="Ex: conversion rate 0.05 OR revenue/user")
-    mde_pct = c2.slider("MDE (%)", 1.0, 50.0, 10.0, 1.0)
-    alpha = c3.selectbox("Alpha", [0.1, 0.05, 0.01], index=1)
-    power = c4.selectbox("Power", [0.7, 0.8, 0.9], index=1)
-
-    std = st.number_input("Std dev (optional, 0 = auto)", value=0.0, min_value=0.0)
-
-    n = ab_test_sample_size_per_group(baseline, mde_pct, alpha=alpha, power=power, std=None if std == 0 else std)
-
-    st.success(f"✅ Required sample size ≈ **{n:,} users per group**")
-
-    st.markdown("### Recommended checklist")
-    st.write(
-        [
-            "Define primary KPI and guardrails",
-            "Randomize unit (user/session/geo) and confirm logging",
-            "Run full business cycle (min 1–2 weeks)",
-            "Avoid peeking; pre-register decision rule",
-        ]
-    )
+    fig = px.bar(roi, x="channel", y="roi", title="ROI by Channel")
+    st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
-    st.subheader("Geo-Test MDE (approx)")
+    st.subheader("📊 Channel Contributions")
 
-    c1, c2, c3 = st.columns(3)
-    baseline_weekly = c1.number_input("Weekly KPI per geo ($)", value=100000.0, min_value=0.0, step=1000.0)
-    weeks = c2.slider("Duration (weeks)", 1, 12, 4)
-    geos = c3.slider("Geos per arm", 5, 200, 20)
+    totals = contrib.sum().reset_index()
+    totals.columns = ["feature", "contribution"]
 
-    cv = st.slider("Geo variability (CV)", 0.05, 0.6, 0.2, 0.01)
-    alpha2 = st.selectbox("Alpha", [0.1, 0.05, 0.01], index=1, key="geo_alpha")
-    power2 = st.selectbox("Power", [0.7, 0.8, 0.9], index=1, key="geo_power")
-
-    res = geo_test_mde(baseline_weekly, weeks, geos, alpha=alpha2, power=power2, cv=cv)
-
-    st.success(f"✅ Estimated MDE ≈ **${res.mde_abs:,.0f} / geo / week**  (≈ **{res.mde_pct:.2f}%**)")
-
-    st.info(res.notes)
-
-    st.markdown("### Suggested timeline")
-    timeline = pd.DataFrame(
-        [
-            {"Week": "W-2 to W-1", "Action": "Select geos, match treatment/control, confirm tracking"},
-            {"Week": "W0", "Action": "Launch spend change in treatment geos only"},
-            {"Week": f"W1–W{weeks}", "Action": "Monitor compliance + guardrails (no decision peeking)"},
-            {"Week": f"W{weeks+1}", "Action": "Analyze lift (DiD/synth control), write exec summary"},
-        ]
-    )
-    st.dataframe(timeline, use_container_width=True)
+    fig = px.bar(totals, x="feature", y="contribution")
+    st.plotly_chart(fig, use_container_width=True)
